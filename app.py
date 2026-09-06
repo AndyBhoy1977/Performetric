@@ -51,6 +51,31 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def shade(series_min, series_max):
+    """Return a Styler function colouring cells low-to-high.
+
+    Written by hand rather than using Styler.background_gradient, which pulls in
+    matplotlib purely to interpolate a colour map — a heavy dependency for a
+    gradient, and one more thing to fail on deploy.
+    """
+    span = (series_max - series_min) or 1.0
+    lo = (0xE0, 0x6C, 0x5E)   # coral
+    mid = (0xE8, 0xA3, 0x3D)  # amber
+    hi = (0x4F, 0xB4, 0x77)   # grass
+
+    def colour(value):
+        if value is None or pd.isna(value):
+            return "color: #8FA3AD"
+        t = min(max((float(value) - series_min) / span, 0.0), 1.0)
+        a, b, local = (lo, mid, t / 0.5) if t < 0.5 else (mid, hi, (t - 0.5) / 0.5)
+        rgb = tuple(int(a[i] + (b[i] - a[i]) * local) for i in range(3))
+        # Keep the fill translucent so the dark theme still reads underneath.
+        text = "#0E1417" if t > 0.55 else "#E8EDEF"
+        return f"background-color: rgba({rgb[0]},{rgb[1]},{rgb[2]},0.55); color: {text}"
+
+    return colour
+
+
 PLOT_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
@@ -673,10 +698,15 @@ if len(matches) > 1:
             if matrix.empty:
                 st.info("No players clear the minimum-minutes filter across these matches.")
             else:
-                st.dataframe(
-                    matrix.round(2).style.background_gradient(cmap="RdYlGn", axis=None),
-                    use_container_width=True,
-                )
+                vals = matrix.to_numpy(dtype="float64")
+                finite = vals[np.isfinite(vals)]
+                if finite.size:
+                    styled = matrix.round(2).style.map(
+                        shade(float(finite.min()), float(finite.max()))
+                    ).format("{:.2f}", na_rep="-")
+                else:
+                    styled = matrix.round(2)
+                st.dataframe(styled, use_container_width=True)
                 st.markdown(
                     '<p class="note">Blank cells mean the player did not clear the minimum-minutes '
                     "filter in that match — usually an unused sub or a short cameo, not missing data.</p>",
