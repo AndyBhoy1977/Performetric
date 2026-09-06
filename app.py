@@ -202,27 +202,64 @@ gps = gps[gps["Position"].isin(sel_positions)]
 # ---------------------------------------------------------------------------
 
 st.sidebar.markdown("### Match analytics")
-st.sidebar.caption("Enter per period, or upload a CSV with a Period column.")
+st.sidebar.caption(
+    "Upload one CSV covering every match (add a Match column), or type figures in "
+    "the second tab. Entries are kept per match while the app is open."
+)
 
 analytics_file = st.sidebar.file_uploader("Analytics CSV (optional)", type=["csv"], key="an")
 
-default_analytics = pd.DataFrame(
-    {
-        "Period": periods_present or ["First half", "Second half"],
-        "xG for": [0.0] * max(len(periods_present), 2),
-        "xG against": [0.0] * max(len(periods_present), 2),
-        "PPDA": [10.0] * max(len(periods_present), 2),
-        "Opp PPDA": [10.0] * max(len(periods_present), 2),
-        "Possession %": [50.0] * max(len(periods_present), 2),
-        "Field tilt %": [50.0] * max(len(periods_present), 2),
-    }
-)
+ANALYTICS_COLS = ["xG for", "xG against", "PPDA", "Opp PPDA", "Possession %", "Field tilt %"]
 
+
+def blank_analytics(periods):
+    periods = list(periods) or ["First half", "Second half"]
+    frame = pd.DataFrame({"Period": periods})
+    for col in ANALYTICS_COLS:
+        frame[col] = 10.0 if "PPDA" in col else (50.0 if "%" in col else 0.0)
+    return frame
+
+
+# Analytics are held per match. Without this, switching match in the sidebar would
+# carry one game's xG and PPDA onto another and quietly produce a wrong report.
+if "analytics_by_match" not in st.session_state:
+    st.session_state.analytics_by_match = {}
+
+uploaded_analytics = None
 if analytics_file is not None:
-    analytics = pd.read_csv(analytics_file)
-    analytics.columns = [c.strip() for c in analytics.columns]
-else:
-    analytics = default_analytics
+    try:
+        uploaded_analytics = pd.read_csv(analytics_file)
+        uploaded_analytics.columns = [c.strip() for c in uploaded_analytics.columns]
+    except Exception as exc:
+        st.sidebar.error(f"Couldn't read that analytics CSV: {exc}")
+
+if uploaded_analytics is not None:
+    if "Match" in uploaded_analytics.columns:
+        matched = 0
+        for label, rows in uploaded_analytics.groupby("Match"):
+            label = str(label).strip()
+            if label in matches:
+                st.session_state.analytics_by_match[label] = (
+                    rows.drop(columns=["Match"]).reset_index(drop=True)
+                )
+                matched += 1
+        unknown = sorted(
+            set(uploaded_analytics["Match"].astype(str).str.strip()) - set(matches)
+        )
+        st.sidebar.success(f"Analytics loaded for {matched} of {len(matches)} match(es).")
+        if unknown:
+            st.sidebar.caption(
+                "No GPS file carries these labels: " + ", ".join(unknown[:3])
+                + ("..." if len(unknown) > 3 else "")
+            )
+    else:
+        # No Match column, so it can only describe the match currently selected.
+        st.session_state.analytics_by_match[selected_match] = uploaded_analytics.copy()
+        st.sidebar.info(f"No Match column — applied to {selected_match}.")
+
+analytics = st.session_state.analytics_by_match.get(
+    selected_match, blank_analytics(periods_present)
+)
 
 st.title("Match Context")
 date_label = str(gps["Date"].iloc[0]) if "Date" in gps and len(gps) else ""
@@ -321,8 +358,10 @@ with tabs[IDX["Physical in context"]]:
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        key="analytics_editor",
+        key=f"analytics_editor::{selected_match}",
     )
+    # Persist so the figures are still here after switching match and back.
+    st.session_state.analytics_by_match[selected_match] = edited
 
     if summary.empty:
         st.warning("No GPS match periods to join against.")
