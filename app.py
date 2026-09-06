@@ -69,8 +69,15 @@ from report import build_match_report
 from pipeline import (
     MATCH_PERIODS,
     WHOLE_SESSION,
+    Z_MIN_MATCHES,
     classify_period,
     load_gps as _load_gps,
+    load_many as _load_many,
+    match_period_rates,
+    match_totals,
+    ordered_matches,
+    player_baselines,
+    player_match_matrix,
     quality_flags,
     reconcile,
 )
@@ -79,6 +86,12 @@ from pipeline import (
 @st.cache_data(show_spinner=False)
 def load_gps(file):
     return _load_gps(file)
+
+
+@st.cache_data(show_spinner=False)
+def load_library(payloads):
+    """payloads: tuple of (name, bytes). Hashable, so Streamlit can cache it."""
+    return _load_many([(name, io.BytesIO(data)) for name, data in payloads])
 
 
 def period_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -114,15 +127,20 @@ def period_summary(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 st.sidebar.markdown("### Data")
-gps_file = st.sidebar.file_uploader("StatSports export (CSV)", type=["csv"])
+gps_files = st.sidebar.file_uploader(
+    "StatSports exports (CSV)", type=["csv"], accept_multiple_files=True,
+    help="Upload one match or several. Matches are keyed on the date and the opponent "
+         "read from the drill titles.",
+)
 
-if gps_file is None:
+if not gps_files:
     st.title("Match Context")
     st.markdown(
         '<p class="lede">Physical output read against what the team was actually doing on the pitch.</p>',
         unsafe_allow_html=True,
     )
-    st.info("Upload a StatSports drill export to begin. Any export with player name, drill title and total distance will parse.")
+    st.info("Upload one or more StatSports drill exports to begin. Any export with player name, "
+            "drill title and total distance will parse.")
     st.markdown(
         """
 **What this does**
@@ -130,6 +148,8 @@ if gps_file is None:
 Your GPS export is split by drill — warm up, first half, second half, conditioning. Match analytics
 are reported the same way: per half, per phase. This tool joins the two on that shared key and shows
 physical output alongside the tactical picture that produced it.
+
+Upload several matches and it will also track how the squad and each player move across them.
 
 **What it does not do**
 
@@ -139,21 +159,42 @@ data, which is a different build.
     )
     st.stop()
 
-try:
-    gps, colmap = load_gps(gps_file)
-except Exception as exc:
-    st.error(str(exc))
+# Read once into bytes so the loader can be cached across reruns.
+payloads = tuple((f.name, f.getvalue()) for f in gps_files)
+library = load_library(payloads)
+
+if library.empty:
+    st.error("Nothing parsed from those files. Check they are StatSports drill exports.")
+    for name, msg in library.attrs.get("errors", []):
+        st.caption(f"{name}: {msg}")
     st.stop()
 
+for name, msg in library.attrs.get("errors", []):
+    st.sidebar.warning(f"Skipped {name} — {msg}")
+
+matches = ordered_matches(library)
+
+st.sidebar.markdown("### Match")
+if len(matches) > 1:
+    selected_match = st.sidebar.selectbox(
+        "Report on", matches, index=len(matches) - 1,
+        help="The first four tabs cover this match. The last tab compares across all of them.",
+    )
+else:
+    selected_match = matches[0]
+    st.sidebar.caption(matches[0])
+
+gps = library[library["Match"] == selected_match].copy()
 periods_present = [p for p in MATCH_PERIODS if p in set(gps["Period"])]
 
 st.sidebar.markdown("### Filters")
-positions = sorted(gps["Position"].unique())
+positions = sorted(library["Position"].unique())
 sel_positions = st.sidebar.multiselect("Position", positions, default=positions)
 
 min_exposure = st.sidebar.slider("Minimum match minutes", 0, 60, 15, 5,
                                  help="Players below this are excluded from squad comparisons.")
 
+library = library[library["Position"].isin(sel_positions)]
 gps = gps[gps["Position"].isin(sel_positions)]
 
 # ---------------------------------------------------------------------------
@@ -185,14 +226,17 @@ else:
 
 st.title("Match Context")
 date_label = str(gps["Date"].iloc[0]) if "Date" in gps and len(gps) else ""
+lib_note = f" · {len(matches)} matches loaded" if len(matches) > 1 else ""
 st.markdown(
-    f'<p class="lede">StatSports export joined to match analytics at period level'
-    + (f" · {date_label}" if date_label else "")
-    + "</p>",
+    f'<p class="lede">{selected_match}{lib_note}</p>',
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["Period profile", "Physical in context", "Players", "Data check", "Export"])
+tab_names = ["Period profile", "Physical in context", "Players", "Data check", "Export"]
+if len(matches) > 1:
+    tab_names.insert(3, "Across matches")
+tabs = st.tabs(tab_names)
+IDX = {name: i for i, name in enumerate(tab_names)}
 
 # Populated inside the context tab; the Export tab reads them further down.
 joined = None
@@ -215,7 +259,7 @@ summary = period_summary(squad) if len(squad) else pd.DataFrame()
 # TAB 1 — Period profile
 # ---------------------------------------------------------------------------
 
-with tabs[0]:
+with tabs[IDX["Period profile"]]:
     if summary.empty:
         st.warning("No match periods found. Check the drill titles in your export name the halves.")
     else:
@@ -268,7 +312,7 @@ with tabs[0]:
 # TAB 2 — Physical in context
 # ---------------------------------------------------------------------------
 
-with tabs[1]:
+with tabs[IDX["Physical in context"]]:
     st.markdown("#### Match analytics")
     st.caption("Edit these to match your Opta / Wyscout / StatsBomb period splits. Values persist while the app runs.")
 
@@ -410,7 +454,7 @@ with tabs[1]:
 # TAB 3 — Players
 # ---------------------------------------------------------------------------
 
-with tabs[2]:
+with tabs[IDX["Players"]]:
     if match.empty:
         st.warning("No match periods in this export.")
     else:
@@ -457,7 +501,7 @@ with tabs[2]:
 # TAB 4 — Data check
 # ---------------------------------------------------------------------------
 
-with tabs[3]:
+with tabs[IDX["Data check"]]:
     st.markdown("#### Before you report anything")
     st.caption("Run this every time. A clean-looking dashboard built on a broken export is worse than no dashboard.")
 
@@ -479,10 +523,133 @@ with tabs[3]:
     st.dataframe(mapping, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------------
+# Across matches
+# ---------------------------------------------------------------------------
+
+if len(matches) > 1:
+    with tabs[IDX["Across matches"]]:
+        totals = match_totals(library, min_exposure)
+        per_period = match_period_rates(library, min_exposure)
+
+        if totals.empty:
+            st.warning("No match periods found across the library.")
+        else:
+            st.markdown("#### Squad trend")
+            st.caption("Whole-match exposure-weighted rates, oldest to newest.")
+
+            trend_metrics = [m for m in ("m/min", "HSR/min", "Mechanical load/min")
+                             if m in totals]
+            chosen = st.multiselect("Metrics", trend_metrics,
+                                    default=trend_metrics[:2], key="trend_metrics")
+
+            if chosen:
+                short = [m.split(" v ")[0] if " v " not in m else m for m in totals["Match"]]
+                fig = go.Figure()
+                palette = [GRASS, AMBER, CORAL]
+                for i, metric in enumerate(chosen):
+                    fig.add_trace(go.Scatter(
+                        x=totals["Match"], y=totals[metric], name=metric,
+                        mode="lines+markers", line=dict(color=palette[i % 3], width=3),
+                        marker=dict(size=9),
+                        yaxis="y" if i == 0 else "y2",
+                    ))
+                layout = dict(PLOT_LAYOUT)
+                layout.pop("yaxis")
+                fig.update_layout(
+                    height=380,
+                    yaxis=dict(title=chosen[0], gridcolor=LINE),
+                    yaxis2=dict(title=chosen[1] if len(chosen) > 1 else "",
+                                overlaying="y", side="right",
+                                gridcolor="rgba(0,0,0,0)"),
+                    **layout,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.dataframe(totals.round(2), use_container_width=True, hide_index=True)
+
+            st.markdown("#### First half against second half, by match")
+            st.caption("Whether the within-match pattern repeats or varies with the opponent.")
+
+            metric = st.selectbox("Metric", trend_metrics, key="hh_metric")
+            pivot = per_period.pivot_table(index="Match", columns="Period", values=metric)
+            pivot = pivot.reindex(index=matches,
+                                  columns=[p for p in MATCH_PERIODS if p in pivot.columns])
+
+            fig2 = go.Figure()
+            colours = {"First half": GRASS, "Second half": AMBER, "Extra time": CORAL}
+            for period in pivot.columns:
+                fig2.add_bar(x=pivot.index, y=pivot[period], name=period,
+                             marker_color=colours.get(period, MUTED))
+            fig2.update_layout(barmode="group", height=360, **PLOT_LAYOUT)
+            st.plotly_chart(fig2, use_container_width=True)
+
+            if len(pivot.columns) >= 2:
+                drop = ((pivot.iloc[:, 1] - pivot.iloc[:, 0]) / pivot.iloc[:, 0] * 100)
+                consistent = (drop < 0).all() or (drop > 0).all()
+                direction = "falls" if drop.mean() < 0 else "rises"
+                st.markdown(
+                    f'<div class="flag flag-ok">{metric} {direction} from first to second half in '
+                    f'{int((drop < 0).sum() if drop.mean() < 0 else (drop > 0).sum())} of '
+                    f'{len(drop)} matches, by {abs(drop.mean()):.0f}% on average.'
+                    + (" That is a pattern, not a one-off." if consistent else
+                       " It varies by match, so it is worth looking at opponent and game state "
+                       "before treating it as a conditioning issue.")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.divider()
+            st.markdown("#### Individual against own baseline")
+            st.caption(
+                f"Each player's most recent match against their own average from earlier matches. "
+                f"A squad average hides the player who is well down on his own normal."
+            )
+
+            base_metric = st.selectbox("Baseline metric", trend_metrics, key="base_metric")
+            baselines = player_baselines(library, base_metric, min_exposure)
+
+            if baselines.empty:
+                st.info("Not enough overlapping matches yet. Players need at least two to compare.")
+            else:
+                worst = baselines.head(3)
+                cols = st.columns(min(3, len(worst)))
+                for col, (_, row) in zip(cols, worst.iterrows()):
+                    col.metric(row["Player"], f"{row['Latest']:.1f}",
+                               f"{row['Change %']:+.1f}% vs own average")
+
+                show = baselines.copy()
+                if show["Z score"].isna().all():
+                    show = show.drop(columns=["Z score"])
+                    st.caption(
+                        f"Z scores are withheld until a player has {Z_MIN_MATCHES} matches in "
+                        "their baseline. A standard deviation from three matches is arithmetic, "
+                        "not a finding."
+                    )
+                st.dataframe(show.round(2), use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.markdown("#### Player by match")
+            grid_metric = st.selectbox("Grid metric", trend_metrics, key="grid_metric")
+            matrix = player_match_matrix(library, grid_metric, min_exposure)
+            if matrix.empty:
+                st.info("No players clear the minimum-minutes filter across these matches.")
+            else:
+                st.dataframe(
+                    matrix.round(2).style.background_gradient(cmap="RdYlGn", axis=None),
+                    use_container_width=True,
+                )
+                st.markdown(
+                    '<p class="note">Blank cells mean the player did not clear the minimum-minutes '
+                    "filter in that match — usually an unused sub or a short cameo, not missing data.</p>",
+                    unsafe_allow_html=True,
+                )
+
+
+# ---------------------------------------------------------------------------
 # TAB 5 — Export
 # ---------------------------------------------------------------------------
 
-with tabs[4]:
+with tabs[IDX["Export"]]:
     st.markdown("#### Match report (PDF)")
     st.caption("One page, built for a coach to read in thirty seconds. Includes the readings and the data-quality flags.")
 

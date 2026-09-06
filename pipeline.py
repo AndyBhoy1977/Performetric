@@ -230,3 +230,225 @@ def quality_flags(df: pd.DataFrame) -> list:
     return flags
 
 
+
+
+# ---------------------------------------------------------------------------
+# Multi-match: identity, loading, and cross-match aggregation
+# ---------------------------------------------------------------------------
+
+def extract_opponent(df: pd.DataFrame) -> str:
+    """Pull the opponent out of drill titles like '2. First Half v Denmark'."""
+    for title in df["Drill"].unique():
+        m = re.search(r"\bv\.?\s+([A-Z][\w' \-]+)$", str(title).strip())
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def match_label(df: pd.DataFrame, fallback: str = "") -> str:
+    """A stable, human-readable key for one match file."""
+    date = ""
+    if "Date" in df and len(df):
+        date = str(df["Date"].iloc[0]).strip()
+    opp = extract_opponent(df)
+    if date and opp:
+        return f"{date} v {opp}"
+    if date:
+        return date
+    return opp or fallback or "Unlabelled match"
+
+
+def _sort_key(label: str):
+    """Sort match labels chronologically on a leading dd/mm/yyyy where present."""
+    m = re.match(r"(\d{2})/(\d{2})/(\d{4})", str(label))
+    return (int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else (0, 0, 0)
+
+
+def load_many(files) -> pd.DataFrame:
+    """Load several StatSports exports into one frame with a Match column.
+
+    `files` is a list of (name, file-like) pairs. Files that fail to parse are
+    skipped and reported, so one bad export doesn't sink the whole library.
+    """
+    frames, errors = [], []
+    for name, handle in files:
+        try:
+            df, _ = load_gps(handle)
+        except Exception as exc:
+            errors.append((name, str(exc)))
+            continue
+        df = df.copy()
+        df["Match"] = match_label(df, fallback=str(name))
+        df["Source file"] = str(name)
+        frames.append(df)
+
+    if not frames:
+        combined = pd.DataFrame()
+    else:
+        combined = pd.concat(frames, ignore_index=True)
+        # De-duplicate: same match uploaded twice keeps the first copy.
+        combined = combined.drop_duplicates(
+            subset=["Match", "Player", "Drill"], keep="first"
+        )
+    combined.attrs["errors"] = errors
+    return combined
+
+
+def ordered_matches(df: pd.DataFrame) -> list:
+    """Match labels, oldest first."""
+    if df is None or df.empty or "Match" not in df:
+        return []
+    return sorted(df["Match"].unique(), key=_sort_key)
+
+
+def match_period_rates(df: pd.DataFrame, min_minutes: float = 15) -> pd.DataFrame:
+    """Exposure-weighted squad rates for every match x period in the library."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    match_only = df[df["Period"].isin(MATCH_PERIODS)].copy()
+    if match_only.empty:
+        return pd.DataFrame()
+
+    # Eligibility is judged per match, not across the library.
+    exposure = match_only.groupby(["Match", "Player"])["Minutes"].sum().reset_index()
+    keep = exposure[exposure["Minutes"] >= min_minutes][["Match", "Player"]]
+    match_only = match_only.merge(keep, on=["Match", "Player"], how="inner")
+
+    rows = []
+    for (match, period), g in match_only.groupby(["Match", "Period"]):
+        total_min = g["Minutes"].sum()
+        if not total_min:
+            continue
+        row = {
+            "Match": match,
+            "Period": period,
+            "Players": g["Player"].nunique(),
+            "Total minutes": total_min,
+            "Distance (m)": g["Distance (m)"].sum(),
+            "m/min": g["Distance (m)"].sum() / total_min,
+        }
+        if "HSR (m)" in g:
+            row["HSR (m)"] = g["HSR (m)"].sum()
+            row["HSR/min"] = g["HSR (m)"].sum() / total_min
+        if "Accels" in g and "Decels" in g:
+            row["Mechanical load/min"] = (g["Accels"].sum() + g["Decels"].sum()) / total_min
+        if "Max speed" in g:
+            row["Peak speed"] = g["Max speed"].max()
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    order = {p: i for i, p in enumerate(MATCH_PERIODS)}
+    return out.sort_values(
+        ["Match", "Period"],
+        key=lambda s: s.map(_sort_key) if s.name == "Match" else s.map(order),
+    )
+
+
+def match_totals(df: pd.DataFrame, min_minutes: float = 15) -> pd.DataFrame:
+    """One row per match: whole-match squad rates, halves combined."""
+    rates = match_period_rates(df, min_minutes)
+    if rates.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for match, g in rates.groupby("Match"):
+        total_min = g["Total minutes"].sum()
+        row = {
+            "Match": match,
+            "Total minutes": total_min,
+            "Distance (m)": g["Distance (m)"].sum(),
+            "m/min": g["Distance (m)"].sum() / total_min,
+        }
+        if "HSR (m)" in g:
+            row["HSR/min"] = g["HSR (m)"].sum() / total_min
+        if "Mechanical load/min" in g:
+            row["Mechanical load/min"] = float(
+                np.average(g["Mechanical load/min"], weights=g["Total minutes"])
+            )
+        if "Peak speed" in g:
+            row["Peak speed"] = g["Peak speed"].max()
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values("Match", key=lambda s: s.map(_sort_key))
+
+
+def player_match_matrix(df: pd.DataFrame, metric: str = "m/min",
+                        min_minutes: float = 15) -> pd.DataFrame:
+    """Players down the side, matches across the top, for one rate metric."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    match_only = df[df["Period"].isin(MATCH_PERIODS)].copy()
+    if match_only.empty:
+        return pd.DataFrame()
+
+    source = {"m/min": ("Distance (m)", None),
+              "HSR/min": ("HSR (m)", None),
+              "Mechanical load/min": ("Accels", "Decels")}.get(metric)
+
+    rows = []
+    for (match, player), g in match_only.groupby(["Match", "Player"]):
+        minutes = g["Minutes"].sum()
+        if minutes < min_minutes:
+            continue
+        if source is None:
+            value = g[metric].mean() if metric in g else np.nan
+        else:
+            a, b = source
+            if a not in g:
+                continue
+            total = g[a].sum() + (g[b].sum() if b and b in g else 0)
+            value = total / minutes
+        rows.append({"Player": player, "Match": match, metric: value, "Minutes": minutes})
+
+    if not rows:
+        return pd.DataFrame()
+
+    long = pd.DataFrame(rows)
+    wide = long.pivot_table(index="Player", columns="Match", values=metric, aggfunc="mean")
+    return wide.reindex(columns=sorted(wide.columns, key=_sort_key))
+
+
+# A standard deviation computed from a handful of matches is unstable: with three
+# prior matches a z-score of 18 is arithmetic, not a finding. Below this many
+# baseline matches the z-score is withheld and only the % change is shown.
+Z_MIN_MATCHES = 5
+
+
+def player_baselines(df: pd.DataFrame, metric: str = "m/min",
+                     min_minutes: float = 15, min_matches: int = 3) -> pd.DataFrame:
+    """Compare each player's latest match against their own previous average.
+
+    This is the comparison that matters individually — a squad average hides the
+    player who is 20% down on his own normal. Needs a few matches to mean anything,
+    hence min_matches.
+    """
+    wide = player_match_matrix(df, metric, min_minutes)
+    if wide.empty or wide.shape[1] < 2:
+        return pd.DataFrame()
+
+    latest_col = wide.columns[-1]
+    prior = wide.iloc[:, :-1]
+
+    rows = []
+    for player, row in wide.iterrows():
+        history = prior.loc[player].dropna()
+        latest = row[latest_col]
+        if pd.isna(latest) or len(history) < min(min_matches - 1, 1):
+            continue
+        mean = history.mean()
+        sd = history.std(ddof=0)
+        n = int(len(history))
+        z = (latest - mean) / sd if sd and sd > 0 and n >= Z_MIN_MATCHES else np.nan
+        rows.append({
+            "Player": player,
+            "Latest": latest,
+            "Own average": mean,
+            "Matches in baseline": n,
+            "Change %": (latest - mean) / mean * 100 if mean else np.nan,
+            "Z score": z,
+        })
+
+    out = pd.DataFrame(rows)
+    return out.sort_values("Change %") if not out.empty else out
