@@ -65,6 +65,7 @@ PLOT_LAYOUT = dict(
 # Pipeline (pure logic lives in pipeline.py so it can be tested and reused)
 # ---------------------------------------------------------------------------
 
+from report import build_match_report
 from pipeline import (
     MATCH_PERIODS,
     WHOLE_SESSION,
@@ -193,6 +194,11 @@ st.markdown(
 
 tabs = st.tabs(["Period profile", "Physical in context", "Players", "Data check", "Export"])
 
+# Populated inside the context tab; the Export tab reads them further down.
+joined = None
+readings = []
+
+
 # ---------------------------------------------------------------------------
 # Squad-level period aggregation
 # ---------------------------------------------------------------------------
@@ -285,9 +291,13 @@ with tabs[1]:
             # Contextual derivations
             joined["Out-of-possession m/min"] = joined["m/min"] * (1 - joined["Possession %"] / 100)
             joined["In-possession m/min"] = joined["m/min"] * (joined["Possession %"] / 100)
-            joined["HSR per unit of press"] = joined["HSR/min"] / joined["PPDA"]
+            # PPDA is inverted by definition: a LOWER value means a MORE aggressive press.
+            # Convert it to an intensity that rises with pressure before dividing by it,
+            # otherwise "cost per unit of press" comes out with the sign reversed.
+            joined["Press intensity"] = 100 / joined["PPDA"]
+            joined["HSR per unit of press"] = joined["HSR/min"] / joined["Press intensity"]
             joined["xG per 1000 m"] = joined["xG for"] / (joined["Distance (m)"] / 1000)
-            joined["Mechanical cost of press"] = joined["Mechanical load/min"] / joined["PPDA"]
+            joined["Mechanical cost of press"] = joined["Mechanical load/min"] / joined["Press intensity"]
 
             st.markdown("#### Physical output against tactical picture")
 
@@ -336,36 +346,57 @@ with tabs[1]:
                 a = joined[joined["Period"] == "First half"].iloc[0]
                 b = joined[joined["Period"] == "Second half"].iloc[0]
 
-                d_rate = (b["m/min"] - a["m/min"]) / a["m/min"] * 100 if a["m/min"] else 0
-                d_ppda = (b["PPDA"] - a["PPDA"]) / a["PPDA"] * 100 if a["PPDA"] else 0
+                pct = lambda x, y: (y - x) / x * 100 if x else 0.0
+                d_rate = pct(a["m/min"], b["m/min"])
+                d_ppda = pct(a["PPDA"], b["PPDA"])
+                d_hsr = pct(a.get("HSR/min", 0), b.get("HSR/min", 0))
+                d_mech = pct(a.get("Mechanical load/min", 0), b.get("Mechanical load/min", 0))
 
-                if d_rate < -5 and d_ppda > 5:
+                # Remember: PPDA down = press intensified.
+                pressed_more = d_ppda < -8
+                pressed_less = d_ppda > 8
+
+                if pressed_more and d_hsr > 10:
+                    readings.append(
+                        f"The team went after the game. Press intensified ({d_ppda:.0f}% PPDA) and high-speed "
+                        f"running rose {d_hsr:.0f}%, while total running rate moved {d_rate:+.0f}%. They didn't run "
+                        "further, they ran harder — a change in the type of work, not the amount."
+                    )
+                elif pressed_more:
+                    readings.append(
+                        f"Press intensified ({d_ppda:.0f}% PPDA) but high-speed running moved only {d_hsr:+.0f}%. "
+                        "More pressure asked for without more intensity behind it. Worth checking whether the press "
+                        "was being triggered but not supported."
+                    )
+                elif pressed_less and d_rate < -5:
                     readings.append(
                         f"Running rate fell {abs(d_rate):.0f}% and the press loosened ({d_ppda:+.0f}% PPDA). "
-                        "Consistent picture — the team dropped off and the physical numbers follow. "
-                        "Whether that was chosen or forced is a coaching conversation, not a data one."
+                        "Consistent picture — the team dropped off and the physical numbers follow. Whether that "
+                        "was chosen or forced is a coaching conversation, not a data one."
                     )
-                elif d_rate < -5 and d_ppda < -5:
-                    readings.append(
-                        f"Running rate fell {abs(d_rate):.0f}% while the press intensified ({d_ppda:.0f}% PPDA). "
-                        "The team asked for more pressure from less output. Worth checking whether the press was "
-                        "being triggered but not supported."
-                    )
-                elif d_rate > 5 and d_ppda > 5:
+                elif pressed_less and d_rate > 5:
                     readings.append(
                         f"Running rate rose {d_rate:.0f}% while the press loosened. Output went into recovery runs "
                         "and transitions rather than pressure — often a chasing-the-game profile."
                     )
                 else:
                     readings.append(
-                        f"Running rate moved {d_rate:+.0f}% and PPDA {d_ppda:+.0f}%. Both broadly stable across halves."
+                        f"Running rate moved {d_rate:+.0f}%, high-speed running {d_hsr:+.0f}% and PPDA "
+                        f"{d_ppda:+.0f}%. Broadly stable across halves."
                     )
 
                 if "Mechanical cost of press" in joined:
-                    if b["Mechanical cost of press"] > a["Mechanical cost of press"] * 1.15:
+                    d_cost = pct(a["Mechanical cost of press"], b["Mechanical cost of press"])
+                    if d_cost > 15:
                         readings.append(
-                            "Accel/decel cost per unit of press rose in the second half — the same pressure is "
-                            "being bought with more braking. That is the load that shows up in the following days."
+                            f"Accel/decel load per unit of press rose {d_cost:.0f}%. The same pressure is being "
+                            "bought with more braking — that is the load that shows up in the following days."
+                        )
+                    elif d_cost < -15:
+                        readings.append(
+                            f"Accel/decel load per unit of press fell {abs(d_cost):.0f}%. More press for less "
+                            f"mechanical outlay, even though absolute load rose {d_mech:+.0f}%. Efficient, but the "
+                            "absolute figure is still what the players have to recover from."
                         )
 
             for r in readings:
@@ -452,7 +483,48 @@ with tabs[3]:
 # ---------------------------------------------------------------------------
 
 with tabs[4]:
-    st.markdown("#### Take it away")
+    st.markdown("#### Match report (PDF)")
+    st.caption("One page, built for a coach to read in thirty seconds. Includes the readings and the data-quality flags.")
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        report_title = st.text_input("Report title", value=f"Match report{' — ' + str(date_label) if date_label else ''}")
+        squad_label = st.text_input("Squad / team", value="", placeholder="e.g. Ireland U19 men")
+    with rc2:
+        source_label = st.text_input("Data source", value="StatSports + match analytics")
+        mark_sample = st.checkbox(
+            "Mark as sample data", value=True,
+            help="Stamps the footer. Leave on for anything that isn't a real club's match.",
+        )
+
+    if summary.empty:
+        st.info("No match periods found, so there is nothing to report on yet.")
+    else:
+        try:
+            pdf_bytes = build_match_report(
+                summary=summary.round(2),
+                joined=joined.round(3) if joined is not None else None,
+                readings=readings,
+                flags=quality_flags(gps),
+                meta={
+                    "title": report_title or "Match report",
+                    "date": str(date_label) if date_label else "",
+                    "squad": squad_label,
+                    "source": source_label,
+                    "sample": mark_sample,
+                },
+                squad=squad,
+            )
+            st.download_button(
+                "Download match report (PDF)", pdf_bytes,
+                file_name=f"match_report_{datetime.now():%Y%m%d}.pdf",
+                mime="application/pdf", type="primary",
+            )
+        except Exception as exc:
+            st.error(f"Couldn't build the PDF: {exc}")
+
+    st.divider()
+    st.markdown("#### Underlying data")
 
     clean_csv = gps.to_csv(index=False).encode()
     st.download_button("Cleaned GPS data (CSV)", clean_csv,
