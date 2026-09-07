@@ -634,15 +634,32 @@ with tabs[IDX["Pitch"]]:
             st.info("Press Load tracking to pull the match.")
     else:
         up = st.file_uploader("Tracking CSV (Metrica layout)", type=["csv"], key="pitch_up")
+        st.caption(
+            "Needs per-player x/y coordinates. A StatSports drill export will not work "
+            "here — it has no positional data."
+        )
         if up is not None:
+            import sources as _sources
             try:
-                tracking = pd.read_csv(up, skiprows=2)
+                tracking = _sources.tidy_tracking(pd.read_csv(up, skiprows=2))
+            except _sources.TrackingFormatError as exc:
+                st.error(str(exc))
+                tracking = None
             except Exception as exc:
                 st.error(f"Couldn't read that file: {exc}")
+                tracking = None
 
+    candidates = []
     if tracking is not None and not tracking.empty:
         candidates = sorted({c[:-2] for c in tracking.columns if c.endswith("_x")
                              and not c.lower().startswith("ball")})
+        if not candidates or "Period" not in tracking.columns:
+            st.error(
+                "That file loaded but doesn't contain per-player coordinates and a Period "
+                "column, so there is nothing to place on a pitch."
+            )
+
+    if candidates and "Period" in tracking.columns:
         # The keeper is whoever averages nearest his own goal across the match.
         keeper = st.selectbox(
             "Goalkeeper", candidates, key="pitch_keeper",

@@ -217,13 +217,52 @@ def metrica_events(game: int = 1) -> pd.DataFrame:
     return pd.read_csv(f"{METRICA}/Sample_Game_{game}/Sample_Game_{game}_RawEventsData.csv")
 
 
-def metrica_tracking(game: int = 1, side: str = "Home") -> pd.DataFrame:
-    """25 Hz tracking for one side, tidied into Period / Frame / Time / player x,y."""
-    url = f"{METRICA}/Sample_Game_{game}/Sample_Game_{game}_RawTrackingData_{side}_Team.csv"
-    raw = pd.read_csv(url, skiprows=2)
+class TrackingFormatError(ValueError):
+    """Raised when a file doesn't look like positional tracking data."""
+
+
+def tidy_tracking(raw: pd.DataFrame) -> pd.DataFrame:
+    """Normalise a wide tracking export into Period / Frame / Time / player_x,_y.
+
+    Used by both the Metrica downloader and the app's upload path, so an uploaded
+    file goes through exactly the same normalisation as a fetched one.
+    """
+    cols = list(raw.columns)
+    if len(cols) < 5:
+        raise TrackingFormatError(
+            "This file has too few columns to be tracking data. Tracking has one x and "
+            "one y column per player. If you meant to load a StatSports drill export, "
+            "that belongs in the sidebar uploader — it has no coordinates, so it cannot "
+            "drive the pitch views."
+        )
+
+    # Validate BEFORE renaming. The rename below manufactures the _x/_y suffixes,
+    # so checking for them afterwards would pass any wide CSV, including a GPS
+    # drill export whose columns would be silently relabelled as coordinates.
+    already_tidy = any(str(c).endswith("_x") for c in cols)
+    if not already_tidy:
+        # In a Metrica-layout file every y column is unheaded, so roughly half the
+        # columns past the first three read as "Unnamed".
+        tail = cols[3:]
+        unnamed = sum(1 for c in tail if str(c).startswith("Unnamed"))
+        if not tail or unnamed / len(tail) < 0.35:
+            raise TrackingFormatError(
+                "This doesn't look like positional tracking data. A tracking export "
+                "pairs each player with an unheaded second column for the y coordinate. "
+                "A StatSports drill export has one row per player per drill and no "
+                "coordinates at all — it can't drive the pitch views. Load it in the "
+                "sidebar instead."
+            )
+
+        numeric = raw[tail].apply(pd.to_numeric, errors="coerce")
+        if numeric.notna().mean().mean() < 0.5:
+            raise TrackingFormatError(
+                "The coordinate columns are mostly non-numeric, so this can't be "
+                "tracking data. Check the file has the two-row Metrica header above "
+                "the data."
+            )
 
     # Columns arrive as Player11, Unnamed:4, Player1, Unnamed:6 ... — x then y.
-    cols = list(raw.columns)
     renamed = {cols[0]: "Period", cols[1]: "Frame", cols[2]: "Time"}
     for i in range(3, len(cols) - 1, 2):
         name = str(cols[i])
@@ -231,9 +270,28 @@ def metrica_tracking(game: int = 1, side: str = "Home") -> pd.DataFrame:
             continue
         renamed[cols[i]] = f"{name}_x"
         renamed[cols[i + 1]] = f"{name}_y"
-    raw = raw.rename(columns=renamed)
-    keep = ["Period", "Frame", "Time"] + [c for c in raw.columns if c.endswith(("_x", "_y"))]
-    return raw[keep]
+    out = raw.rename(columns=renamed)
+
+    coord_cols = [c for c in out.columns if c.endswith(("_x", "_y"))]
+    if not coord_cols:
+        raise TrackingFormatError(
+            "No player coordinate columns found. Expected a header row naming each "
+            "player, with an x column and a y column for each. Check the file has the "
+            "two-row Metrica header, and that you haven't uploaded a GPS drill export."
+        )
+    if "Period" not in out.columns:
+        raise TrackingFormatError(
+            "No Period column found. The first three columns should be Period, Frame "
+            "and Time. Check whether this export uses a different header layout."
+        )
+
+    return out[["Period", "Frame", "Time"] + coord_cols]
+
+
+def metrica_tracking(game: int = 1, side: str = "Home") -> pd.DataFrame:
+    """25 Hz tracking for one side, tidied into Period / Frame / Time / player x,y."""
+    url = f"{METRICA}/Sample_Game_{game}/Sample_Game_{game}_RawTrackingData_{side}_Team.csv"
+    return tidy_tracking(pd.read_csv(url, skiprows=2))
 
 
 def metrica_physical(game: int = 1, side: str = "Home",
