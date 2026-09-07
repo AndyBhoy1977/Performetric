@@ -83,24 +83,67 @@ def draw_pitch(height=560, title=""):
 # Normalising direction of play
 # ---------------------------------------------------------------------------
 
-def attacking_direction(tracking: pd.DataFrame, keeper: str) -> dict:
+def detect_keeper(tracking: pd.DataFrame) -> str:
+    """Best guess at the goalkeeper: present all match, and closest to a goal.
+
+    Direction of play is derived from the keeper, so naming the wrong player
+    silently corrupts every half-to-half comparison. Auto-detecting a sensible
+    default matters more than it looks.
+    """
+    players = sorted({c[:-2] for c in tracking.columns
+                      if c.endswith("_x") and not c.lower().startswith("ball")})
+    periods = sorted(tracking["Period"].dropna().unique())
+
+    best, best_score = None, -1.0
+    for player in players:
+        scores = []
+        for period in periods:
+            chunk = tracking[tracking["Period"] == period]
+            x = chunk[f"{player}_x"].dropna()
+            if len(x) < len(chunk) * 0.5:      # not on for most of this half
+                scores = []
+                break
+            scores.append(abs(x.mean() - 0.5))  # distance from halfway
+        if scores and np.mean(scores) > best_score:
+            best, best_score = player, float(np.mean(scores))
+    return best or (players[0] if players else None)
+
+
+def attacking_direction(tracking: pd.DataFrame, keeper: str,
+                        strict: bool = True) -> dict:
     """Work out which way the team attacked in each half, from the keeper.
 
     The keeper stands nearest his own goal, so his mean x tells you the end the
     team was defending — and therefore the end they were attacking.
     """
-    out = {}
+    out, missing = {}, []
     for period, chunk in tracking.groupby("Period"):
         x = chunk[f"{keeper}_x"].dropna()
-        if x.empty:
+        # Require real coverage. A player who came on at half time gives a reading
+        # for one period only, and the other silently falls back to "no flip",
+        # which leaves the two halves plotted at opposite ends of the pitch.
+        if len(x) < len(chunk) * 0.5:
+            missing.append(int(period))
             continue
         # Keeper in the left half means the team attacks right (+1).
         out[int(period)] = 1 if x.mean() < 0.5 else -1
+
+    if strict and missing:
+        raise ValueError(
+            f"'{keeper}' isn't on the pitch for period(s) {missing}, so the direction "
+            "of play can't be established there. Pick a player who played the whole "
+            "match — normally the goalkeeper."
+        )
     return out
 
 
 def normalise(x, y, direction):
     """Flip coordinates so the team always attacks left to right."""
+    if direction not in (1, -1):
+        raise ValueError(
+            f"Unknown direction of play ({direction!r}). Refusing to plot rather than "
+            "silently leaving a half unflipped."
+        )
     if direction == 1:
         return x * PITCH_X, y * PITCH_Y
     return (1 - x) * PITCH_X, (1 - y) * PITCH_Y
@@ -126,8 +169,10 @@ def average_positions(tracking: pd.DataFrame, keeper: str,
 
     rows = []
     for period, chunk in tracking.groupby("Period"):
-        d = dirs.get(int(period), 1)
         label = {1: "First half", 2: "Second half"}.get(int(period))
+        if label is None or int(period) not in dirs:
+            continue
+        d = dirs[int(period)]
         if label is None:
             continue
         for player in players:
@@ -244,7 +289,9 @@ def defensive_actions(events: pd.DataFrame, team: str, keeper_dirs: dict,
         chunk = ev[ev["Period"] == period]
         if chunk.empty:
             continue
-        d = keeper_dirs.get(period, 1)
+        if period not in keeper_dirs:
+            continue
+        d = keeper_dirs[period]
         x, y = normalise(chunk["Start X"], chunk["Start Y"], d)
         fig.add_trace(go.Scatter(
             x=x, y=y, mode="markers", name=f"{label}  (n={len(chunk)})",
@@ -283,7 +330,9 @@ def running_by_zone(tracking: pd.DataFrame, keeper: str, bins_x: int = 6,
         label = {1: "First half", 2: "Second half"}.get(int(period))
         if label is None:
             continue
-        d = dirs.get(int(period), 1)
+        if int(period) not in dirs:
+            continue
+        d = dirs[int(period)]
         chunk = chunk.sort_values("Frame")
 
         for player in players:

@@ -94,6 +94,7 @@ from report import build_match_report
 from pitch import (
     attacking_direction,
     average_positions,
+    detect_keeper,
     defensive_actions,
     running_by_zone,
     shift_map,
@@ -625,11 +626,19 @@ with tabs[IDX["Pitch"]]:
         if loaded:
             game, side = loaded
             with st.spinner("Downloading and processing tracking — takes a moment"):
+                import sources as _sources
                 try:
                     tracking = cached_tracking(game, side)
                     events_df = cached_events(game)
+                except _sources.TrackingFormatError as exc:
+                    st.error(f"The open data didn't parse as tracking: {exc}")
+                    tracking = None
                 except Exception as exc:
-                    st.error(f"Couldn't fetch the open data: {exc}")
+                    st.error(
+                        f"Couldn't fetch the open data: {type(exc).__name__} — {exc}. "
+                        "This step needs outbound access to raw.githubusercontent.com."
+                    )
+                    tracking = None
         else:
             st.info("Press Load tracking to pull the match.")
     else:
@@ -655,26 +664,51 @@ with tabs[IDX["Pitch"]]:
                              and not c.lower().startswith("ball")})
         if not candidates or "Period" not in tracking.columns:
             st.error(
-                "That file loaded but doesn't contain per-player coordinates and a Period "
-                "column, so there is nothing to place on a pitch."
+                "That data loaded but doesn't have what the pitch views need: a Period "
+                "column and one x/y pair per player."
             )
+            with st.expander("What actually arrived"):
+                st.write({
+                    "rows": len(tracking),
+                    "columns": len(tracking.columns),
+                    "Period present": "Period" in tracking.columns,
+                    "players detected": len(candidates),
+                })
+                st.code(", ".join(map(str, list(tracking.columns)[:24])) or "(no columns)")
+                st.caption(
+                    "If you are on the demo source and seeing this, the fetch returned "
+                    "something other than the tracking file — usually a network block or "
+                    "a changed URL. Clear the cache from the app menu and retry."
+                )
 
     if candidates and "Period" in tracking.columns:
         # The keeper is whoever averages nearest his own goal across the match.
+        auto = detect_keeper(tracking)
         keeper = st.selectbox(
-            "Goalkeeper", candidates, key="pitch_keeper",
-            help="Used to work out which way the team attacked in each half. "
-                 "Get this wrong and both halves will be flipped the same way.",
+            "Goalkeeper", candidates,
+            index=candidates.index(auto) if auto in candidates else 0,
+            key="pitch_keeper",
+            help="Used to work out which way the team attacked in each half. It must be "
+                 "someone who played the whole match, or one half can't be oriented.",
         )
+        if auto and keeper == auto:
+            st.caption(f"{auto} detected as the goalkeeper.")
 
-        dirs = attacking_direction(tracking, keeper)
-        st.caption(
-            "Direction of play detected: "
-            + ", ".join(f"{'H' + str(p)} {'left to right' if d == 1 else 'right to left'}"
-                        for p, d in sorted(dirs.items()))
-            + ". Second-half coordinates are flipped so both halves are comparable."
-        )
+        try:
+            dirs = attacking_direction(tracking, keeper)
+        except ValueError as exc:
+            st.error(str(exc))
+            dirs = None
 
+        if dirs:
+            st.caption(
+                "Direction of play: "
+                + ", ".join(f"{'H' + str(p)} {'left to right' if d == 1 else 'right to left'}"
+                            for p, d in sorted(dirs.items()))
+                + ". Second-half coordinates are flipped so the halves are comparable."
+            )
+
+    if candidates and "Period" in tracking.columns and dirs:
         positions = average_positions(tracking, keeper)
         phys = cached_physical(tracking, keeper)
 
