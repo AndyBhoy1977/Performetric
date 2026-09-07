@@ -244,6 +244,17 @@ def metrica_physical(game: int = 1, side: str = "Home",
     be compared like for like: minutes, distance, m/min, HSR, sprints, accels.
     """
     track = metrica_tracking(game, side)
+    return metrica_physical_from_frame(track, smooth_frames=smooth_frames)
+
+
+def metrica_physical_from_frame(track: pd.DataFrame, keeper: str = None,
+                                smooth_frames: int = 7) -> pd.DataFrame:
+    """Same as metrica_physical() but from a tracking frame already in memory.
+
+    Lets the app compute once from an uploaded or cached file instead of
+    re-downloading. `keeper` is accepted so callers can pass it positionally
+    alongside the tracking frame; it does not change the calculation.
+    """
     # The tracking file carries the ball as another tracked object. Left in, it
     # contributes ~420 m/min and wrecks every squad-level rate.
     players = sorted({c[:-2] for c in track.columns

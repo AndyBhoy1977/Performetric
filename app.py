@@ -91,6 +91,14 @@ PLOT_LAYOUT = dict(
 # ---------------------------------------------------------------------------
 
 from report import build_match_report
+from pitch import (
+    attacking_direction,
+    average_positions,
+    defensive_actions,
+    running_by_zone,
+    shift_map,
+    zone_difference,
+)
 from pipeline import (
     MATCH_PERIODS,
     WHOLE_SESSION,
@@ -111,6 +119,30 @@ from pipeline import (
 @st.cache_data(show_spinner=False)
 def load_gps(file):
     return _load_gps(file)
+
+
+@st.cache_data(show_spinner=False)
+def cached_tracking(game, side):
+    import sources
+    return sources.metrica_tracking(game, side)
+
+
+@st.cache_data(show_spinner=False)
+def cached_events(game):
+    import sources
+    return sources.metrica_events(game)
+
+
+@st.cache_data(show_spinner=False)
+def cached_physical(tracking, keeper):
+    """Per-player physical from tracking. Cached: it is the slow step."""
+    import sources
+    return sources.metrica_physical_from_frame(tracking, keeper)
+
+
+@st.cache_data(show_spinner=False)
+def cached_zones(tracking, keeper):
+    return running_by_zone(tracking, keeper)
 
 
 @st.cache_data(show_spinner=False)
@@ -294,9 +326,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_names = ["Period profile", "Physical in context", "Players", "Data check", "Export"]
+tab_names = ["Period profile", "Physical in context", "Players", "Pitch", "Data check", "Export"]
 if len(matches) > 1:
-    tab_names.insert(3, "Across matches")
+    tab_names.insert(4, "Across matches")
 tabs = st.tabs(tab_names)
 IDX = {name: i for i, name in enumerate(tab_names)}
 
@@ -560,6 +592,124 @@ with tabs[IDX["Players"]]:
                                     "Sprints", "Sprint distance (m)", "Accels", "Decels", "Max speed"]
                         if c in pdata]
         st.dataframe(pdata[display_cols].round(2), use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------------
+# Pitch — needs tracking data, which a drill export does not contain
+# ---------------------------------------------------------------------------
+
+with tabs[IDX["Pitch"]]:
+    st.markdown("#### Where it happened")
+    st.caption(
+        "These views need positional tracking — x/y for every player, many times a second. "
+        "A StatSports drill export has totals and rates but no coordinates, so it cannot "
+        "drive them. Load a tracking file, or use the open demo match."
+    )
+
+    source = st.radio(
+        "Tracking source", ["Metrica open data (demo)", "Upload tracking CSV"],
+        horizontal=True, key="pitch_source",
+    )
+
+    tracking = None
+    events_df = None
+    keeper = None
+
+    if source.startswith("Metrica"):
+        game = st.selectbox("Match", [1, 2], key="pitch_game",
+                            format_func=lambda g: f"Metrica sample game {g}")
+        side = st.radio("Side", ["Home", "Away"], horizontal=True, key="pitch_side")
+        if st.button("Load tracking", key="pitch_load"):
+            st.session_state.pitch_loaded = (game, side)
+
+        loaded = st.session_state.get("pitch_loaded")
+        if loaded:
+            game, side = loaded
+            with st.spinner("Downloading and processing tracking — takes a moment"):
+                try:
+                    tracking = cached_tracking(game, side)
+                    events_df = cached_events(game)
+                except Exception as exc:
+                    st.error(f"Couldn't fetch the open data: {exc}")
+        else:
+            st.info("Press Load tracking to pull the match.")
+    else:
+        up = st.file_uploader("Tracking CSV (Metrica layout)", type=["csv"], key="pitch_up")
+        if up is not None:
+            try:
+                tracking = pd.read_csv(up, skiprows=2)
+            except Exception as exc:
+                st.error(f"Couldn't read that file: {exc}")
+
+    if tracking is not None and not tracking.empty:
+        candidates = sorted({c[:-2] for c in tracking.columns if c.endswith("_x")
+                             and not c.lower().startswith("ball")})
+        # The keeper is whoever averages nearest his own goal across the match.
+        keeper = st.selectbox(
+            "Goalkeeper", candidates, key="pitch_keeper",
+            help="Used to work out which way the team attacked in each half. "
+                 "Get this wrong and both halves will be flipped the same way.",
+        )
+
+        dirs = attacking_direction(tracking, keeper)
+        st.caption(
+            "Direction of play detected: "
+            + ", ".join(f"{'H' + str(p)} {'left to right' if d == 1 else 'right to left'}"
+                        for p, d in sorted(dirs.items()))
+            + ". Second-half coordinates are flipped so both halves are comparable."
+        )
+
+        positions = average_positions(tracking, keeper)
+        phys = cached_physical(tracking, keeper)
+
+        view = st.radio(
+            "View",
+            ["Average position by half", "Where the ball was won", "High-speed metres by zone"],
+            key="pitch_view",
+        )
+
+        if view.startswith("Average"):
+            metric = st.selectbox("Colour arrows by",
+                                  ["HSR/min", "m/min", "Sprints"], key="pitch_metric")
+            st.plotly_chart(
+                shift_map(positions, phys, metric,
+                          "Arrow = territorial change · colour = change in " + metric),
+                use_container_width=True,
+            )
+            h1 = positions[positions["Period"] == "First half"]
+            h2 = positions[positions["Period"] == "Second half"]
+            if not h1.empty and not h2.empty:
+                a = h1.nsmallest(4, "x")["x"].mean()
+                b = h2.nsmallest(4, "x")["x"].mean()
+                st.markdown(
+                    f'<div class="flag flag-ok">Defensive line {a:.0f} m to {b:.0f} m '
+                    f'({b - a:+.0f} m). Team average position {h1["x"].mean():.0f} m to '
+                    f'{h2["x"].mean():.0f} m. Read this next to the running numbers: being '
+                    "pushed back while working harder is a different problem from fading."
+                    "</div>", unsafe_allow_html=True)
+
+        elif view.startswith("Where"):
+            if events_df is None:
+                st.info("Recovery locations need the event file. Use the Metrica demo source.")
+            else:
+                team_side = st.session_state.get("pitch_loaded", (1, "Home"))[1]
+                st.plotly_chart(
+                    defensive_actions(events_df, team_side, dirs,
+                                      title="Ball recoveries, with mean height marked"),
+                    use_container_width=True,
+                )
+                st.caption("Press height measured off the pitch rather than asserted.")
+
+        else:
+            zones = cached_zones(tracking, keeper)
+            st.plotly_chart(
+                zone_difference(zones, title="High-speed metres, second half minus first"),
+                use_container_width=True,
+            )
+            st.caption(
+                "Green means more high-speed running in that zone in the second half. "
+                "A falling total and a rising total in your own third are different findings."
+            )
+
 
 # ---------------------------------------------------------------------------
 # TAB 4 — Data check
