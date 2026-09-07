@@ -18,6 +18,7 @@ import json
 import urllib.error
 import urllib.request
 
+import numpy as np
 import pandas as pd
 
 BASE = "https://raw.githubusercontent.com/statsbomb/open-data/master/data"
@@ -180,3 +181,187 @@ def analytics_csv(jobs) -> pd.DataFrame:
         rows.insert(0, "Match", label)
         frames.append(rows)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Metrica Sports open data — tracking AND events for the same matches
+# ---------------------------------------------------------------------------
+#
+# Metrica released three anonymised matches with 25 Hz tracking for every player
+# plus the matching event stream. Tracking is the only free source from which
+# genuine physical metrics can be derived — distance, speed, high-speed running,
+# accelerations — because you compute them yourself from positions rather than
+# relying on a provider's published aggregate.
+#
+# It is the one open source that fills BOTH halves of this app's join.
+#
+# Caveat that matters: these are optical positions, not GPS pods. Distances will
+# not equal StatSports values for the same match, and the two should never be
+# plotted on one axis. Use it to build and demo the tool, not to benchmark a club.
+
+METRICA = "https://raw.githubusercontent.com/metrica-sports/sample-data/master/data"
+
+PITCH_X, PITCH_Y = 105.0, 68.0   # metres, Metrica convention
+FRAME_HZ = 25.0
+
+# Thresholds in m/s. 5.5 m/s is ~19.8 km/h, the common high-speed running line;
+# 7.0 m/s is ~25.2 km/h for sprinting. Clubs set these differently — change them
+# to match whatever the club's StatSports profile uses before comparing anything.
+HSR_MS = 5.5
+SPRINT_MS = 7.0
+ACCEL_MS2 = 3.0
+
+
+def metrica_events(game: int = 1) -> pd.DataFrame:
+    """Event stream for one Metrica sample game (1, 2 or 3)."""
+    return pd.read_csv(f"{METRICA}/Sample_Game_{game}/Sample_Game_{game}_RawEventsData.csv")
+
+
+def metrica_tracking(game: int = 1, side: str = "Home") -> pd.DataFrame:
+    """25 Hz tracking for one side, tidied into Period / Frame / Time / player x,y."""
+    url = f"{METRICA}/Sample_Game_{game}/Sample_Game_{game}_RawTrackingData_{side}_Team.csv"
+    raw = pd.read_csv(url, skiprows=2)
+
+    # Columns arrive as Player11, Unnamed:4, Player1, Unnamed:6 ... — x then y.
+    cols = list(raw.columns)
+    renamed = {cols[0]: "Period", cols[1]: "Frame", cols[2]: "Time"}
+    for i in range(3, len(cols) - 1, 2):
+        name = str(cols[i])
+        if name.startswith("Unnamed"):
+            continue
+        renamed[cols[i]] = f"{name}_x"
+        renamed[cols[i + 1]] = f"{name}_y"
+    raw = raw.rename(columns=renamed)
+    keep = ["Period", "Frame", "Time"] + [c for c in raw.columns if c.endswith(("_x", "_y"))]
+    return raw[keep]
+
+
+def metrica_physical(game: int = 1, side: str = "Home",
+                     smooth_frames: int = 7) -> pd.DataFrame:
+    """Per-player, per-half physical metrics derived from tracking positions.
+
+    Returns the same shape of metrics the GPS pipeline produces, so the output can
+    be compared like for like: minutes, distance, m/min, HSR, sprints, accels.
+    """
+    track = metrica_tracking(game, side)
+    # The tracking file carries the ball as another tracked object. Left in, it
+    # contributes ~420 m/min and wrecks every squad-level rate.
+    players = sorted({c[:-2] for c in track.columns
+                      if c.endswith("_x") and not c.lower().startswith("ball")})
+
+    rows = []
+    for period, chunk in track.groupby("Period"):
+        chunk = chunk.sort_values("Frame")
+        label = PERIOD_NAMES.get(int(period))
+        if label is None:
+            continue
+        minutes = len(chunk) / FRAME_HZ / 60
+
+        for player in players:
+            x = chunk[f"{player}_x"] * PITCH_X
+            y = chunk[f"{player}_y"] * PITCH_Y
+            if x.notna().sum() < FRAME_HZ * 60:      # under a minute on pitch
+                continue
+
+            # Smooth before differencing: raw optical positions are noisy, and
+            # unsmoothed velocity badly overstates distance and acceleration.
+            xs = x.rolling(smooth_frames, center=True, min_periods=1).mean()
+            ys = y.rolling(smooth_frames, center=True, min_periods=1).mean()
+
+            step = np.sqrt(xs.diff() ** 2 + ys.diff() ** 2)
+            speed = step * FRAME_HZ                                   # m/s
+            speed = speed.where(speed < 12.0)                         # drop tracking jumps
+            accel = speed.diff() * FRAME_HZ                           # m/s^2
+
+            on_pitch_min = x.notna().sum() / FRAME_HZ / 60
+            distance = float(step.sum())
+            hsr = float(step[speed >= HSR_MS].sum())
+            sprint = float(step[speed >= SPRINT_MS].sum())
+
+            # Count efforts, not frames: a run is one effort however long it lasts.
+            def efforts(mask):
+                return int((mask.astype(int).diff() == 1).sum())
+
+            rows.append({
+                "Player": player,
+                "Period": label,
+                "Minutes": round(on_pitch_min, 2),
+                "Distance (m)": round(distance, 1),
+                "m/min": round(distance / on_pitch_min, 1) if on_pitch_min else np.nan,
+                "HSR (m)": round(hsr, 1),
+                "HSR/min": round(hsr / on_pitch_min, 2) if on_pitch_min else np.nan,
+                "Sprint distance (m)": round(sprint, 1),
+                "Sprints": efforts(speed >= SPRINT_MS),
+                "Accels": efforts(accel >= ACCEL_MS2),
+                "Decels": efforts(accel <= -ACCEL_MS2),
+                "Max speed (m/s)": round(float(speed.max()), 2),
+            })
+
+    order = {"First half": 0, "Second half": 1, "Extra time": 2}
+    out = pd.DataFrame(rows)
+    return out.sort_values(["Player", "Period"], key=lambda s: s.map(order) if s.name == "Period" else s)
+
+
+def metrica_period_summary(game: int = 1, side: str = "Home",
+                           exclude: tuple = ()) -> pd.DataFrame:
+    """Squad-level exposure-weighted rates per half, matching the app's summary.
+
+    `exclude` drops named players — worth using for the goalkeeper, whose ~40 m/min
+    pulls the squad rate down and isn't comparable to outfield work anyway.
+    """
+    phys = metrica_physical(game, side)
+    if exclude:
+        phys = phys[~phys["Player"].isin(exclude)]
+    rows = []
+    for period, g in phys.groupby("Period"):
+        mins = g["Minutes"].sum()
+        rows.append({
+            "Period": period,
+            "Players": g["Player"].nunique(),
+            "Total minutes": round(mins, 1),
+            "Distance (m)": round(g["Distance (m)"].sum(), 1),
+            "m/min": round(g["Distance (m)"].sum() / mins, 1),
+            "HSR/min": round(g["HSR (m)"].sum() / mins, 2),
+            "Mechanical load/min": round((g["Accels"].sum() + g["Decels"].sum()) / mins, 2),
+        })
+    order = {"First half": 0, "Second half": 1, "Extra time": 2}
+    return pd.DataFrame(rows).sort_values("Period", key=lambda s: s.map(order))
+
+
+def metrica_as_statsports(game: int = 1, side: str = "Home", opponent: str = "Away",
+                          date: str = "01/01/2020", exclude: tuple = ()) -> pd.DataFrame:
+    """Write Metrica-derived physical data in the column layout the app ingests.
+
+    Lets you drive the whole tool from open data end to end: this for the GPS
+    side, period_analytics() for the analytics side, joined on the same periods.
+    Values are optical-derived, so label them as such wherever they are shown.
+    """
+    phys = metrica_physical(game, side)
+    if exclude:
+        phys = phys[~phys["Player"].isin(exclude)]
+
+    drill = {"First half": f"2. First Half v {opponent}",
+             "Second half": f"3. Second Half v {opponent}",
+             "Extra time": f"4. Extra Time v {opponent}"}
+
+    def hms(minutes):
+        total = int(round(minutes * 60))
+        return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+    out = pd.DataFrame({
+        "Player Display Name": phys["Player"],
+        "Date": date,
+        "Drill Title": phys["Period"].map(drill),
+        "Player Primary Position": "Unknown",
+        "Total Time": phys["Minutes"].map(hms),
+        "Total Distance": phys["Distance (m)"],
+        "Distance Per Min": phys["m/min"],
+        "High Speed Running (Absolute)": phys["HSR (m)"],
+        "HSR Per Minute (Absolute)": phys["HSR/min"],
+        "Sprints": phys["Sprints"],
+        "Sprint Distance": phys["Sprint distance (m)"],
+        "Accelerations (Absolute)": phys["Accels"],
+        "Decelerations (Absolute)": phys["Decels"],
+        "Max Speed": (phys["Max speed (m/s)"] * 3.6).round(2),   # to km/h
+    })
+    return out.reset_index(drop=True)
