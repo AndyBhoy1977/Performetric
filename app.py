@@ -920,7 +920,7 @@ PITCH_X, PITCH_Y = 105.0, 68.0
 PC_INK = "#12181C"
 PC_LINE = "#3A4750"
 PC_CHALK = "#C9D6DC"
-PC_MUTED = "#8FA3AD"
+PC_MUTED = "#9DB0BA"
 PC_GRASS = "#4FB477"
 PC_AMBER = "#E8A33D"
 PC_CORAL = "#E06C5E"
@@ -1720,7 +1720,7 @@ INK = "#12181C"
 SLATE = "#1E272E"
 LINE = "#2E3A42"
 PAPER = "#E8EDEF"
-MUTED = "#8FA3AD"
+MUTED = "#9DB0BA"
 GRASS = "#4FB477"
 AMBER = "#E8A33D"
 CORAL = "#E06C5E"
@@ -1744,6 +1744,33 @@ st.markdown(
       .flag-bad {{ border-left-color: {CORAL}; background: rgba(224,108,94,0.08); }}
       .flag-ok {{ border-left-color: {GRASS}; background: rgba(79,180,119,0.07); }}
       .note {{ color: {MUTED}; font-size: 0.82rem; }}
+
+      /* Widget labels, captions and help text */
+      label, .stRadio label, .stSelectbox label, .stSlider label,
+      .stMultiSelect label, .stTextInput label, .stCheckbox label,
+      div[data-testid="stWidgetLabel"] p,
+      div[data-testid="stCaptionContainer"], div[data-testid="stCaptionContainer"] p,
+      .stMarkdown p, .stMarkdown li {{ color: {PAPER} !important; }}
+      div[data-testid="stCaptionContainer"] p {{ color: {MUTED} !important; }}
+
+      /* Inputs and dropdowns */
+      div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {{
+        background: {SLATE}; border-color: {LINE}; color: {PAPER};
+      }}
+      div[data-baseweb="popover"] li {{ color: {PAPER}; }}
+      .stRadio div[role="radiogroup"] label p {{ color: {PAPER} !important; }}
+
+      /* Tables */
+      .stDataFrame, .stDataFrame td, .stDataFrame th {{ color: {PAPER}; }}
+
+      /* File uploader */
+      section[data-testid="stFileUploaderDropzone"] {{
+        background: {SLATE}; border: 1px dashed {LINE};
+      }}
+      section[data-testid="stFileUploaderDropzone"] * {{ color: {PAPER}; }}
+
+      /* Expander */
+      details summary, details summary p {{ color: {PAPER} !important; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -1763,7 +1790,7 @@ def shade(series_min, series_max):
 
     def colour(value):
         if value is None or pd.isna(value):
-            return "color: #8FA3AD"
+            return "color: #9DB0BA"
         t = min(max((float(value) - series_min) / span, 0.0), 1.0)
         a, b, local = (lo, mid, t / 0.5) if t < 0.5 else (mid, hi, (t - 0.5) / 0.5)
         rgb = tuple(int(a[i] + (b[i] - a[i]) * local) for i in range(3))

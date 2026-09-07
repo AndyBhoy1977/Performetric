@@ -1,0 +1,15 @@
+# Tells Streamlit the app is dark. Without this, native widgets — selectboxes,
+# tables, radio labels, the data editor — keep their light-theme text colour
+# (#31333F), which measures 1.43:1 against this background and is unreadable.
+# CSS in app.py cannot reach inside those components, so it has to be set here.
+
+[theme]
+base = "dark"
+primaryColor = "#4FB477"
+backgroundColor = "#12181C"
+secondaryBackgroundColor = "#1E272E"
+textColor = "#E8EDEF"
+font = "sans serif"
+
+[server]
+maxUploadSize = 50
